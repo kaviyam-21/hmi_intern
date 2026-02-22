@@ -1,20 +1,27 @@
 import re
-from .config import VIN_REGEX, OCR_CORRECTION_MAP
+from .config import ID_REGEX
 
-class VINValidator:
+class IDValidator:
     @staticmethod
     def clean_text(text: str) -> str:
         """Uppercase and remove all whitespace."""
         return re.sub(r'[\s\W_]+', '', text).upper()
 
     @staticmethod
-    def correct_characters(text: str) -> str:
-        """Apply common OCR correction mappings."""
-        corrected = list(text)
-        for i, char in enumerate(corrected):
-            if char in OCR_CORRECTION_MAP:
-                corrected[i] = OCR_CORRECTION_MAP[char]
-        return "".join(corrected)
+    def validate(text: str) -> bool:
+        """Check if the text matches the general ID format."""
+        return bool(re.match(ID_REGEX, text))
+
+class VINValidator(IDValidator):
+    # Keep VIN-specific logic for backward compatibility if needed, 
+    # but base it on general IDValidator for now.
+    @staticmethod
+    def process_and_validate(text: str) -> tuple[bool, str, bool]:
+        """Backward compatibility stub."""
+        cleaned = IDValidator.clean_text(text)
+        is_valid = IDValidator.validate(cleaned)
+        return is_valid, cleaned, False
+
 
     @staticmethod
     def is_check_digit_valid(vin: str) -> bool:
@@ -48,6 +55,7 @@ class VINValidator:
             remainder = total % 11
             check_digit = 'X' if remainder == 10 else str(remainder)
             
+            print(f"DEBUG Checksum: {vin} -> Remainder {remainder}, Expected {vin[8]}, Calculated {check_digit}", flush=True)
             return vin[8] == check_digit
         except (ValueError, KeyError):
             return False

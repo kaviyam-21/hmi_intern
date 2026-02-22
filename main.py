@@ -1,8 +1,18 @@
 import os
-# Required for PaddlePaddle stability on Windows
+# Suppress PaddleOCR logging and fix PIR/oneDNN executor issues on Windows
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 os.environ['PADDLE_USE_MKLDNN'] = '0'
 os.environ['PADDLE_DISABLE_DNNL'] = '1'
+os.environ['FLAGS_use_onednn'] = '0'
+os.environ['FLAGS_enable_pir_api'] = '0' 
+os.environ['FLAGS_enable_pir_in_executor'] = '0'
+os.environ['FLAGS_enable_new_executor'] = '0'
+os.environ['FLAGS_enable_new_ir'] = '0'
+os.environ['FLAGS_enable_onednn'] = '0'
+os.environ['FLAGS_use_mkldnn'] = '0'
+os.environ['FLAGS_use_cuda'] = '0'
+
+
 
 import sys
 import argparse
@@ -23,7 +33,10 @@ def main():
         pipeline = VINExtractionPipeline(use_gpu=args.gpu)
         result = pipeline.process_image(args.image_path)
         print(result)
-    except Exception:
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"Error: {e}")
         print("Invalid VIN")
 
 if __name__ == "__main__":

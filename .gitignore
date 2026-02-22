@@ -161,6 +161,29 @@ cython_debug/
 output/
 debug/
 temp/
+
+# Test images and debug outputs
 *.jpg
 *.jpeg
 *.png
+!README.md
+ocr_debug*.jpg
+ocr_debug*.png
+
+# Test/debug scripts
+debug_*.py
+test_*.py
+
+# Model cache directories (HuggingFace transformers)
+.cache/
+models/
+*.pt
+*.pth
+*.onnx
+
+# IDE and OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~

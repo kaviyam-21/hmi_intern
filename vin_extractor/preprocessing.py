@@ -11,26 +11,45 @@ class PreProcessor:
 
     @staticmethod
     def deskew(image: np.ndarray) -> np.ndarray:
-        """Correct image tilt/skew using minAreaRect on the largest text contours."""
+        """Robust deskewing for tilted industrial text using Hough Lines."""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+        
+        # Use HoughLinesP to find text line slopes
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, 100, minLineLength=100, maxLineGap=10)
+        
+        if lines is not None:
+            angles = []
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+                # Only consider horizontal-ish lines (-45 to 45 degrees)
+                if -45 < angle < 45:
+                    angles.append(angle)
+            
+            if angles:
+                median_angle = np.median(angles)
+                (h, w) = image.shape[:2]
+                center = (w // 2, h // 2)
+                M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
+                rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                return rotated
+        
+        # Fallback to current simple deskew if lines aren't found
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
         thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
-
         coords = np.column_stack(np.where(thresh > 0))
-        if len(coords) == 0:
-            return image
-        angle = cv2.minAreaRect(coords)[-1]
+        if len(coords) > 0:
+            angle = cv2.minAreaRect(coords)[-1]
+            if angle < -45: angle = -(90 + angle)
+            else: angle = -angle
+            (h, w) = image.shape[:2]
+            center = (w // 2, h // 2)
+            M = cv2.getRotationMatrix2D(center, angle, 1.0)
+            return cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+            
+        return image
 
-        if angle < -45:
-            angle = -(90 + angle)
-        else:
-            angle = -angle
-
-        (h, w) = image.shape[:2]
-        center = (w // 2, h // 2)
-        m = cv2.getRotationMatrix2D(center, angle, 1.0)
-        rotated = cv2.warpAffine(image, m, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-        return rotated
 
     @staticmethod
     def remove_glare(gray: np.ndarray) -> np.ndarray:
@@ -91,11 +110,6 @@ class PreProcessor:
         return thresh
 
     @staticmethod
-    def detect_vin_candidates(image: np.ndarray) -> list[np.ndarray]:
-        """Detect potential VIN regions using scale-aware edge detection."""
-        h_orig, w_orig = image.shape[:2]
-        
-    @staticmethod
     def strategy_thinning(roi: np.ndarray) -> np.ndarray:
         """Strategy: Thin strokes to prevent character merging (O vs C, B vs 8)."""
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -111,7 +125,8 @@ class PreProcessor:
         """Detect potential VIN regions using scale-aware edge detection."""
         h_orig, w_orig = image.shape[:2]
         
-        target_w = 2000 
+        # Reduced target width for better performance (was 2000)
+        target_w = 1000 
         if w_orig < target_w:
             scale = target_w / w_orig
             # Switch to LANCZOS4 for higher quality upscaling
@@ -215,41 +230,36 @@ class PreProcessor:
         return cv2.normalize(high_pass, None, 0, 255, cv2.NORM_MINMAX)
 
     @staticmethod
+    def bilateral_filtering(image: np.ndarray) -> np.ndarray:
+        """Edge-preserving noise reduction using Bilateral Filter."""
+        return cv2.bilateralFilter(image, 9, 75, 75)
+
+    @staticmethod
     def get_all_variants(roi: np.ndarray) -> list:
-        """Generator for different preprocessing variants tailored for metal engravings."""
+        """
+        Compact preprocessing set for better OCR stability on CPU:
+        - Grayscale
+        - CLAHE (clipLimit=3.0)
+        - Mild Gaussian blur (3x3)
+        - Adaptive threshold only for low-contrast regions
+        """
         roi_clean = PreProcessor.deskew(roi)
-        gray = cv2.cvtColor(roi_clean, cv2.COLOR_BGR2GRAY)
-        
-        # 1. High-frequency detail boost
-        unsharp = PreProcessor.strategy_unsharp_mask(roi_clean)
-        
-        variants = [
-            roi_clean,
-            gray,
-            unsharp,
-            PreProcessor.strategy_character_deepening(roi_clean),
-            PreProcessor.strategy_shadow_normalization(roi_clean),
-            PreProcessor.strategy_high_pass(roi_clean),
-        ]
-        
-        # 2. Add lighting robust variants
-        for gamma in [0.5, 0.8, 1.2, 1.8]:
-            variants.append(PreProcessor.strategy_gamma(roi_clean, gamma=gamma))
-            
-        # 3. Dedicated contrast-level binary variants
-        for alpha in [1.3, 1.8, 2.3]:
-            # Apply some denoising before contrast boost
-            denoised = cv2.medianBlur(gray, 3)
-            boosted = PreProcessor.adjust_contrast_brightness(denoised, alpha=alpha, beta=-30)
-            
-            # Small grid CLAHE for high-frequency detail
-            clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 4)).apply(boosted)
-            _, t_otsu = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            variants.append(t_otsu)
-            
-            # 4. Thinning/Dilation variants
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-            variants.append(cv2.erode(t_otsu, kernel, iterations=1))
-            variants.append(cv2.dilate(t_otsu, kernel, iterations=1))
+        gray = cv2.cvtColor(roi_clean, cv2.COLOR_BGR2GRAY) if len(roi_clean.shape) == 3 else roi_clean
+
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
+        blur = cv2.GaussianBlur(clahe, (3, 3), 0)
+
+        variants = [gray, clahe, blur]
+
+        # Contrast-aware thresholding: only add when local contrast is low.
+        hist_var = float(np.var(gray))
+        low_contrast_threshold = 1200.0
+        if hist_var < low_contrast_threshold:
+            adaptive = cv2.adaptiveThreshold(
+                clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 7
+            )
+            variants.append(adaptive)
 
         return variants
+
+

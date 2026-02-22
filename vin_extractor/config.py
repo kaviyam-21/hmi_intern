@@ -12,19 +12,19 @@ DEFAULT_ROI = {
 
 # OCR Configuration
 PADLLE_OCR_LANG = 'en'
-RECOGNITION_CONFIDENCE_THRESHOLD = 0.5
+# Minimum confidence to accept a result. Lower (e.g. 0.35) helps with difficult engravings.
+RECOGNITION_CONFIDENCE_THRESHOLD = 0.40
+# Fallback: if no result meets threshold, accept best result above this (and mark low confidence).
+RECOGNITION_CONFIDENCE_FALLBACK = 0.25
+# Last resort: accept best result with any confidence (e.g. for very difficult engravings).
+RECOGNITION_CONFIDENCE_ANY = 0.01
+
+
 
 # Blur Detection Threshold
 # Laplacian variance below this value is considered too blurry
-BLUR_THRESHOLD = 100.0
+BLUR_THRESHOLD = 30.0
 
-# VIN Validation
-VIN_REGEX = r"^[A-HJ-NPR-Z0-9]{17}$"
+# General ID Validation (No longer restricted to VIN)
+ID_REGEX = r"^[A-Z0-9\-_./: ]+$"
 
-# Character corrections for prohibited characters in VINs (ISO 3779)
-# I, O, Q are never allowed and are common OCR errors for 1, 0, 0
-OCR_CORRECTION_MAP = {
-    'O': '0',
-    'I': '1',
-    'Q': '0'
-}
