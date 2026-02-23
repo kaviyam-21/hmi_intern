@@ -239,17 +239,20 @@ class PreProcessor:
         """
         Compact preprocessing set for better OCR stability on CPU:
         - Grayscale
-        - CLAHE (clipLimit=3.0)
+        - CLAHE (clipLimit between 3.0–3.5)
         - Mild Gaussian blur (3x3)
         - Adaptive threshold only for low-contrast regions
+        - Mild unsharp masking for engraved surfaces
         """
         roi_clean = PreProcessor.deskew(roi)
         gray = cv2.cvtColor(roi_clean, cv2.COLOR_BGR2GRAY) if len(roi_clean.shape) == 3 else roi_clean
 
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
+        clahe = cv2.createCLAHE(clipLimit=3.2, tileGridSize=(8, 8)).apply(gray)
         blur = cv2.GaussianBlur(clahe, (3, 3), 0)
+        # Mild unsharp mask to enhance engraved strokes without oversharpening
+        unsharp = cv2.addWeighted(gray, 1.5, blur, -0.5, 0)
 
-        variants = [gray, clahe, blur]
+        variants = [gray, clahe, blur, unsharp]
 
         # Contrast-aware thresholding: only add when local contrast is low.
         hist_var = float(np.var(gray))

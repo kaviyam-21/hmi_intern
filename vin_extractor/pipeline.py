@@ -93,16 +93,17 @@ class VINExtractionPipeline:
         # Last resort: best result with any confidence (when all confidences are very low)
         best_any = dict(best_result)
 
-        def get_center_x(b):
-            if b['bbox'] is None:
+        def get_left_x(b):
+            bbox = b.get('bbox')
+            if not bbox:
                 return 0
-            return sum(p[0] for p in b['bbox']) / 4
+            return min(p[0] for p in bbox[:4])
 
         def process_blocks(blocks, min_conf):
             valid = [b for b in blocks if b['confidence'] >= min_conf]
             if not valid:
                 return None
-            valid.sort(key=get_center_x)
+            valid.sort(key=get_left_x)
             combined = " ".join(str(b['text']).strip() for b in valid if str(b['text']).strip())
             char_count = sum(1 for c in combined if not c.isspace())
             avg_conf = sum(b['confidence'] for b in valid) / len(valid)
@@ -204,20 +205,15 @@ class VINExtractionPipeline:
 
         def cleanup_output(text: str) -> str:
             """
-            Lightweight cleanup only:
+            Lightweight cleanup only (no length-based filtering):
+            - normalize internal whitespace
             - remove obvious repeated-character hallucinations
-            - drop isolated short fragments (<4 chars)
-            - preserve valid text chunks with length >= 5
             """
             if not text:
                 return ""
             txt = " ".join(text.strip().split())
             txt = re.sub(r"(.)\1{4,}", r"\1\1\1", txt)
-            parts = txt.split(" ")
-            kept = [p for p in parts if len(p) >= 5]
-            if kept:
-                return " ".join(kept).strip()
-            return txt if len(txt) >= 5 else ""
+            return txt
 
         final_text = cleanup_output(raw_text)
 

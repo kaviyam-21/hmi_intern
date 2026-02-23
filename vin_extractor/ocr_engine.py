@@ -21,10 +21,16 @@ os.environ['FLAGS_enable_new_ir'] = '0'
 # Remove restriction to allow better parallelization
 logging.getLogger("ppocr").setLevel(logging.ERROR)
 
+logger = logging.getLogger(__name__)
+
 # Minimum image height accepted by PaddleOCR's recognition model.
 # Images shorter than this will be upscaled to avoid empty results.
 _MIN_REC_HEIGHT = 32
 _MIN_BOX_HEIGHT = 20
+
+# Global shared TrOCR components (loaded once, reused across engine instances)
+_GLOBAL_TROCR_MODEL = None
+_GLOBAL_TROCR_PROCESSOR = None
 
 
 class OCREngine:
@@ -64,20 +70,27 @@ class OCREngine:
             except Exception as e2:
                 raise RuntimeError(f"OCREngine init failed: {e2}") from e2
 
-        # Initialize TrOCR model and processor (load once)
-        try:
-            model_name = "microsoft/trocr-small-printed"
-            self.trocr_processor = TrOCRProcessor.from_pretrained(model_name)
-            self.trocr_model = VisionEncoderDecoderModel.from_pretrained(
-                model_name,
-                low_cpu_mem_usage=True
-            )
-            self.trocr_model.eval()  # Set to evaluation mode
-            if not use_gpu:
-                self.trocr_model = self.trocr_model.to('cpu')
-            logging.info(f"TrOCR model loaded: {model_name}")
-        except Exception as e:
-            raise RuntimeError(f"TrOCR initialization failed: {e}") from e
+        # Initialize TrOCR model and processor (load once, shared globally)
+        global _GLOBAL_TROCR_MODEL, _GLOBAL_TROCR_PROCESSOR
+        if _GLOBAL_TROCR_MODEL is None or _GLOBAL_TROCR_PROCESSOR is None:
+            try:
+                model_name = "microsoft/trocr-small-printed"
+                processor = TrOCRProcessor.from_pretrained(model_name)
+                model = VisionEncoderDecoderModel.from_pretrained(
+                    model_name,
+                    low_cpu_mem_usage=True
+                )
+                model.eval()  # Set to evaluation mode for deterministic inference
+                if not use_gpu:
+                    model = model.to('cpu')
+                _GLOBAL_TROCR_MODEL = model
+                _GLOBAL_TROCR_PROCESSOR = processor
+                logger.info(f"TrOCR model loaded: {model_name}")
+            except Exception as e:
+                raise RuntimeError(f"TrOCR initialization failed: {e}") from e
+
+        self.trocr_model = _GLOBAL_TROCR_MODEL
+        self.trocr_processor = _GLOBAL_TROCR_PROCESSOR
 
 
     # ------------------------------------------------------------------
@@ -188,7 +201,7 @@ class OCREngine:
         x1, x2 = int(min(xs)), int(max(xs))
         y1, y2 = int(min(ys)), int(max(ys))
 
-        # Fixed 5-10px style margin around detected text.
+        # Fixed 5–10 px style margin around detected text.
         pad_x = 8
         pad_y = 6
         x1 -= pad_x
@@ -233,7 +246,7 @@ class OCREngine:
         """
         try:
             h, w = crop.shape[:2]
-            
+
             # Guard for tiny crops: upscale if too small
             if h < 16 or w < 16:
                 scale = max(16 / h, 16 / w)
@@ -241,8 +254,8 @@ class OCREngine:
                 crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
                 h, w = new_h, new_w
             
-            # Resize to optimal height (48-64) for TrOCR while preserving aspect ratio
-            target_height = 56  # Middle of 48-64 range
+            # Resize to fixed height for TrOCR while preserving aspect ratio
+            target_height = 64
             if h != target_height:
                 scale = target_height / h
                 new_h = target_height
@@ -265,17 +278,18 @@ class OCREngine:
             
             # Convert to PIL Image
             pil_image = Image.fromarray(crop_rgb)
-            
-            # Process and predict
+
+            # Process and predict (deterministic beam search, no sampling)
             pixel_values = self.trocr_processor(images=pil_image, return_tensors="pt").pixel_values
             with torch.no_grad():
                 generated = self.trocr_model.generate(
                     pixel_values,
-                    max_length=40,
-                    num_beams=3,
+                    num_beams=4,
                     early_stopping=True,
+                    do_sample=False,
+                    max_length=50,
                     output_scores=True,
-                    return_dict_in_generate=True
+                    return_dict_in_generate=True,
                 )
                 sequences = generated.sequences
                 generated_text = self.trocr_processor.batch_decode(sequences, skip_special_tokens=True)[0]
@@ -295,10 +309,60 @@ class OCREngine:
                 else:
                     confidence = 0.9
             
-            return (generated_text.strip(), confidence)
+            text_out = generated_text.strip()
+            logger.debug(f"TrOCR recognition: text='{text_out}' (len={len(text_out)}), conf={confidence:.4f}")
+            return (text_out, confidence)
         except Exception as e:
-            logging.debug(f"TrOCR recognition failed: {e}")
+            logger.debug(f"TrOCR recognition failed: {e}")
             return ("", 0.0)
+
+    def _recognize_with_sliding_window(self, crop: np.ndarray) -> tuple:
+        """
+        Controlled horizontal sliding-window recognition for very wide crops.
+        Split into overlapping patches (25% overlap), process each once,
+        and merge predictions left-to-right.
+        """
+        h, w = crop.shape[:2]
+        if w <= 0 or h <= 0:
+            return ("", 0.0)
+
+        # Choose patch width as a fraction of the full width (e.g. 40%)
+        patch_width = max(1, int(w * 0.4))
+        if patch_width >= w:
+            return self._recognize_with_trocr(crop, retry_scale=1.0)
+
+        step = max(1, int(patch_width * 0.75))  # 25% overlap
+
+        texts = []
+        confs = []
+
+        x = 0
+        while x < w:
+            end_x = x + patch_width
+            if end_x >= w:
+                end_x = w
+                x = max(0, end_x - patch_width)
+            patch = crop[:, x:end_x]
+            if patch.size == 0:
+                break
+            t, c = self._recognize_with_trocr(patch, retry_scale=1.0)
+            if t:
+                texts.append(t)
+                confs.append(c)
+
+            if end_x == w:
+                break
+            x += step
+
+        if not texts:
+            return ("", 0.0)
+
+        merged_text = "".join(texts)
+        avg_conf = float(sum(confs) / len(confs))
+        logger.debug(
+            f"Sliding-window merge: patches={len(texts)}, merged_len={len(merged_text)}, avg_conf={avg_conf:.4f}"
+        )
+        return (merged_text, avg_conf)
 
     # ------------------------------------------------------------------
     # Public API — unchanged signature
@@ -356,12 +420,43 @@ class OCREngine:
                 debug_items.append({"bbox": valid_bbox, "status": "small_box"})
                 out_blocks.append(block)
                 continue
+            logger.debug(
+                f"Crop from bbox: width={w_crop}, height={h_crop}"
+            )
 
+            # Base recognition
             text, rec_conf = self._recognize_with_trocr(crop, retry_scale=1.0)
-            if rec_conf < 0.85:
-                text_retry, rec_conf_retry = self._recognize_with_trocr(crop, retry_scale=1.2)
+
+            # Controlled sliding window activation
+            sliding_activated = False
+            if w_crop > 600 or rec_conf < 0.75:
+                sliding_activated = True
+                text_sw, conf_sw = self._recognize_with_sliding_window(crop)
+                if conf_sw > rec_conf:
+                    logger.debug(
+                        f"Sliding window improved confidence from {rec_conf:.4f} to {conf_sw:.4f}"
+                    )
+                    text, rec_conf = text_sw, conf_sw
+
+            # Confidence stabilization: single retry with 1.1x scaled crop
+            retry_triggered = False
+            if rec_conf < 0.75:
+                retry_triggered = True
+                text_retry, rec_conf_retry = self._recognize_with_trocr(crop, retry_scale=1.1)
                 if rec_conf_retry > rec_conf:
+                    logger.debug(
+                        f"Retry improved confidence from {rec_conf:.4f} to {rec_conf_retry:.4f}"
+                    )
                     text, rec_conf = text_retry, rec_conf_retry
+
+            if sliding_activated:
+                logger.debug(
+                    f"Sliding window activated for bbox with width={w_crop}, final_conf={rec_conf:.4f}"
+                )
+            if retry_triggered:
+                logger.debug(
+                    f"Confidence retry triggered, final_conf={rec_conf:.4f}"
+                )
 
             if text:
                 det_conf = block.get('confidence', 1.0)
