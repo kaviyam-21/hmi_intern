@@ -6,6 +6,7 @@ import os
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 from PIL import Image
 import torch
+import easyocr
 
 # Suppress PaddleOCR logging and fix PIR/oneDNN executor issues on Windows
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
@@ -31,6 +32,7 @@ _MIN_BOX_HEIGHT = 20
 # Global shared TrOCR components (loaded once, reused across engine instances)
 _GLOBAL_TROCR_MODEL = None
 _GLOBAL_TROCR_PROCESSOR = None
+_GLOBAL_EASYOCR_READER = None
 
 
 class OCREngine:
@@ -91,6 +93,20 @@ class OCREngine:
 
         self.trocr_model = _GLOBAL_TROCR_MODEL
         self.trocr_processor = _GLOBAL_TROCR_PROCESSOR
+
+        # EasyOCR reader for recognition only (CRNN + greedy CTC).
+        # Detection remains PaddleOCR-based per existing architecture.
+        global _GLOBAL_EASYOCR_READER
+        if _GLOBAL_EASYOCR_READER is None:
+            try:
+                _GLOBAL_EASYOCR_READER = easyocr.Reader(
+                    ['en'],
+                    gpu=use_gpu,
+                    verbose=False,
+                )
+            except Exception as e:
+                raise RuntimeError(f"EasyOCR initialization failed: {e}") from e
+        self.easyocr_reader = _GLOBAL_EASYOCR_READER
 
 
     # ------------------------------------------------------------------
@@ -237,10 +253,131 @@ class OCREngine:
         out_path = os.environ.get("OCR_DEBUG_VIS_PATH", "ocr_debug_boxes.jpg")
         cv2.imwrite(out_path, canvas)
 
+    # ------------------------------------------------------------------
+    # Sliding-window text merging helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _remove_repeated_tail(text: str, min_sub_len: int = 4) -> str:
+        """
+        Remove an immediately repeated tail substring to avoid explosions like 'XYZXYZ'.
+        """
+        if not text:
+            return text
+        n = len(text)
+        # Only need to check up to half the length
+        for sub_len in range(n // 2, min_sub_len - 1, -1):
+            if sub_len <= 0:
+                continue
+            a = text[n - 2 * sub_len : n - sub_len]
+            b = text[n - sub_len :]
+            if a == b:
+                return text[: n - sub_len]
+        return text
+
+    @staticmethod
+    def _strict_overlap_merge(
+        a: str,
+        b: str,
+        conf_a: float | None = None,
+        conf_b: float | None = None,
+        min_ratio: float = 0.3,
+        min_ratio_strict: float = 0.4,
+    ) -> tuple[str, float | None]:
+        """
+        STRICT suffix-prefix overlap merge between two patch strings.
+
+        Rules:
+        - Compute max_overlap = min(len(a), len(b)).
+        - Compute min_overlap = max(4, int(0.3 * min(len(a), len(b)))).
+        - Find largest k in [min_overlap, max_overlap] such that a[-k:] == b[:k].
+        - Merge as: a + b[k:].
+
+        Protections:
+        - Reject weak overlaps (1–3 chars) via min_overlap.
+        - If no valid overlap → append safely with duplicate protection.
+        - If b is already contained in a → skip append.
+        - Duplicate tail removal after merge.
+        - If merged length > 1.5x expected (len(a)+len(b)-k) → retry with stricter
+          min_overlap using min_ratio_strict (e.g. 40%).
+        """
+        if not a:
+            return (b or "", conf_b)
+        if not b:
+            return (a, conf_a)
+
+        len_a = len(a)
+        len_b = len(b)
+        if len_a == 0 or len_b == 0:
+            return (a + b, conf_a if conf_b is None else conf_b)
+
+        # STRICT containment checks to avoid internal duplication.
+        if b in a:
+            merged_conf = conf_a if conf_b is None else max(conf_a or 0.0, conf_b or 0.0)
+            return (a, merged_conf)
+        if a in b:
+            merged_conf = conf_b if conf_a is None else max(conf_b or 0.0, conf_a or 0.0)
+            return (b, merged_conf)
+
+        max_overlap = min(len_a, len_b)
+        min_overlap = max(4, int(0.30 * max_overlap))
+
+        def find_k(min_ratio_local: float) -> int:
+            min_ol_local = max(4, int(min_ratio_local * max_overlap))
+            for k in range(max_overlap, min_ol_local - 1, -1):
+                if k < 4:
+                    continue
+                if a[-k:] == b[:k]:
+                    return k
+            return 0
+
+        k = find_k(min_ratio)
+
+        def safe_append(base: str, tail: str) -> str:
+            # Avoid appending if tail already suffix or simple duplicated join.
+            if base.endswith(tail):
+                return base
+            tail_len = min(len(base), len(tail))
+            if tail_len > 1 and base[-tail_len:] == tail[:tail_len]:
+                merged_local = base + tail[tail_len:]
+            else:
+                merged_local = base + tail
+            return OCREngine._remove_repeated_tail(merged_local)
+
+        if k <= 0:
+            merged = safe_append(a, b)
+        else:
+            expected_len = len_a + len_b - k
+            merged = a + b[k:]
+            merged = OCREngine._remove_repeated_tail(merged, min_sub_len=4)
+            # If merged length is unexpectedly large, retry with stricter min_overlap (40%).
+            if expected_len > 0 and len(merged) > 1.5 * expected_len:
+                k_strict = find_k(min_ratio_strict)
+                if k_strict > 0:
+                    expected_len2 = len_a + len_b - k_strict
+                    merged2 = a + b[k_strict:]
+                    merged2 = OCREngine._remove_repeated_tail(merged2, min_sub_len=4)
+                    if expected_len2 > 0 and len(merged2) <= 1.5 * expected_len2:
+                        merged = merged2
+
+        # Merge confidences (simple average when both available)
+        if conf_a is not None and conf_b is not None:
+            merged_conf = (conf_a + conf_b) / 2.0
+        else:
+            merged_conf = conf_a if conf_b is None else conf_b
+
+        return (merged, merged_conf)
+
     def _recognize_with_trocr(self, crop: np.ndarray, retry_scale: float = 1.0) -> tuple:
         """
-        Recognize text from cropped image using TrOCR.
-        Optimized for CPU: resize to fixed text height and single-image inference.
+        Recognize text from cropped image using EasyOCR (CRNN + greedy CTC).
+        Kept name for backward compatibility with the existing pipeline and
+        sliding-window logic.
+        
+        Engraved-text stabilizers:
+        - ROI already padded at crop time (5–10 px margin).
+        - CLAHE contrast enhancement + light dilation before recognition.
+        - Optional stronger preprocessing pass if predicted length looks too short.
         
         Returns: (text: str, confidence: float)
         """
@@ -254,66 +391,79 @@ class OCREngine:
                 crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
                 h, w = new_h, new_w
             
-            # Resize to fixed height for TrOCR while preserving aspect ratio
+            # Normalize to fixed height while preserving aspect ratio
             target_height = 64
             if h != target_height:
                 scale = target_height / h
                 new_h = target_height
                 new_w = max(1, int(w * scale))
                 crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+                h, w = new_h, new_w
             
-            # Apply retry_scale if needed
+            # Apply retry_scale if needed (kept for compatibility)
             if retry_scale != 1.0:
                 h, w = crop.shape[:2]
                 new_h, new_w = int(h * retry_scale), int(w * retry_scale)
                 crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-            
-            # Convert BGR to RGB for PIL
-            if crop.ndim == 2:
-                crop_rgb = cv2.cvtColor(crop, cv2.COLOR_GRAY2RGB)
-            elif crop.ndim == 3:
-                crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-            else:
-                return ("", 0.0)
-            
-            # Convert to PIL Image
-            pil_image = Image.fromarray(crop_rgb)
+                h, w = new_h, new_w
 
-            # Process and predict (deterministic beam search, no sampling)
-            pixel_values = self.trocr_processor(images=pil_image, return_tensors="pt").pixel_values
-            with torch.no_grad():
-                generated = self.trocr_model.generate(
-                    pixel_values,
-                    num_beams=4,
-                    early_stopping=True,
-                    do_sample=False,
-                    max_length=50,
-                    output_scores=True,
-                    return_dict_in_generate=True,
+            allowlist = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-./"
+
+            def run_easyocr(crop_img: np.ndarray) -> tuple[str, float]:
+                results = self.easyocr_reader.readtext(
+                    crop_img,
+                    detail=1,
+                    paragraph=False,
+                    allowlist=allowlist,
                 )
-                sequences = generated.sequences
-                generated_text = self.trocr_processor.batch_decode(sequences, skip_special_tokens=True)[0]
+                if not results:
+                    return ("", 0.0)
+                best_local = max(results, key=lambda r: float(r[2]) if len(r) > 2 else 0.0)
+                raw_local = str(best_local[1]) if len(best_local) > 1 else ""
+                conf_local = float(best_local[2]) if len(best_local) > 2 else 0.0
+                # Strict whitelist + remove spaces
+                text_upper = raw_local.replace(" ", "").upper()
+                text_filtered = "".join(ch for ch in text_upper if ch in allowlist)
+                return text_filtered, conf_local
 
-                # Confidence from token probabilities of generated sequence (when available).
-                step_scores_list = getattr(generated, "scores", None)
-                if step_scores_list is not None:
-                    token_probs = []
-                    for step_idx, step_scores in enumerate(step_scores_list):
-                        token_pos = step_idx + 1  # skip decoder start token
-                        if token_pos >= sequences.shape[1]:
-                            break
-                        token_id = int(sequences[0, token_pos].item())
-                        probs = torch.softmax(step_scores, dim=-1)
-                        token_probs.append(float(probs[0, token_id].item()))
-                    confidence = float(sum(token_probs) / len(token_probs)) if token_probs else 0.9
-                else:
-                    confidence = 0.9
-            
-            text_out = generated_text.strip()
-            logger.debug(f"TrOCR recognition: text='{text_out}' (len={len(text_out)}), conf={confidence:.4f}")
-            return (text_out, confidence)
+            # 1) Base preprocessing: CLAHE + light dilation (2x2 kernel)
+            if crop.ndim == 3:
+                gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = crop
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(gray)
+            kernel = np.ones((2, 2), np.uint8)
+            base_proc = cv2.dilate(enhanced, kernel, iterations=1)
+
+            text_1, conf_1 = run_easyocr(base_proc)
+
+            # 2) Length sanity check based on width/character ratio.
+            approx_char_width = 20.0  # heuristic; keeps this non-aggressive
+            expected_chars = max(1, int(w / approx_char_width))
+            len_ok = len(text_1) >= 0.8 * expected_chars
+
+            # 3) Optional stronger preprocessing if prediction looks too short.
+            if not len_ok:
+                clahe_strong = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(6, 6))
+                enhanced_strong = clahe_strong.apply(gray)
+                strong_proc = cv2.dilate(enhanced_strong, kernel, iterations=2)
+                text_2, conf_2 = run_easyocr(strong_proc)
+
+                # Prefer stronger pass only if it clearly improves length or confidence.
+                if len(text_2) > len(text_1) or conf_2 > conf_1:
+                    logger.debug(
+                        f"Stronger preprocessing improved recognition: "
+                        f"len {len(text_1)}→{len(text_2)}, conf {conf_1:.4f}→{conf_2:.4f}"
+                    )
+                    return (text_2, conf_2)
+
+            logger.debug(
+                f"EasyOCR recognition: text='{text_1}' (len={len(text_1)}), conf={conf_1:.4f}"
+            )
+            return (text_1, conf_1)
         except Exception as e:
-            logger.debug(f"TrOCR recognition failed: {e}")
+            logger.debug(f"EasyOCR recognition failed: {e}")
             return ("", 0.0)
 
     def _recognize_with_sliding_window(self, crop: np.ndarray) -> tuple:
@@ -331,10 +481,14 @@ class OCREngine:
         if patch_width >= w:
             return self._recognize_with_trocr(crop, retry_scale=1.0)
 
-        step = max(1, int(patch_width * 0.75))  # 25% overlap
+        # Safe stride: default 65% of window width, capped at 75% to avoid extreme overlaps.
+        step = max(1, int(patch_width * 0.65))
+        if step > int(patch_width * 0.75):
+            step = int(patch_width * 0.65)
 
-        texts = []
-        confs = []
+        merged_text: str | None = None
+        merged_conf: float | None = None
+        confs: list[float] = []
 
         x = 0
         while x < w:
@@ -347,20 +501,23 @@ class OCREngine:
                 break
             t, c = self._recognize_with_trocr(patch, retry_scale=1.0)
             if t:
-                texts.append(t)
+                if merged_text is None:
+                    merged_text = t
+                    merged_conf = c
+                else:
+                    merged_text, merged_conf = self._strict_overlap_merge(merged_text, t, merged_conf, c)
                 confs.append(c)
 
             if end_x == w:
                 break
             x += step
 
-        if not texts:
+        if not merged_text:
             return ("", 0.0)
 
-        merged_text = "".join(texts)
         avg_conf = float(sum(confs) / len(confs))
         logger.debug(
-            f"Sliding-window merge: patches={len(texts)}, merged_len={len(merged_text)}, avg_conf={avg_conf:.4f}"
+            f"Sliding-window merge: patches={len(confs)}, merged_len={len(merged_text)}, avg_conf={avg_conf:.4f}"
         )
         return (merged_text, avg_conf)
 

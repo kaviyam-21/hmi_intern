@@ -23,15 +23,24 @@ from vin_extractor.pipeline import VINExtractionPipeline
 logging.basicConfig(level=logging.ERROR, format='%(message)s')
 
 def main():
-    parser = argparse.ArgumentParser(description="Industrial VIN Extraction System")
-    parser.add_argument("image_path", help="Path to the input image")
+    parser = argparse.ArgumentParser(description="Industrial VIN / ID Extraction System")
+    parser.add_argument("input_path", help="Path to the input image or video")
+    parser.add_argument(
+        "--mode",
+        choices=["image", "video"],
+        default="image",
+        help="Input mode: 'image' (default) or 'video' for multi-frame fusion",
+    )
     parser.add_argument("--gpu", action="store_true", help="Use GPU for OCR if available")
     
     args = parser.parse_args()
 
     try:
         pipeline = VINExtractionPipeline(use_gpu=args.gpu)
-        result = pipeline.process_image(args.image_path)
+        if args.mode == "image":
+            result = pipeline.process_image(args.input_path)
+        else:
+            result = pipeline.process_input(args.input_path, mode="video")
         print(result)
     except Exception as e:
         import traceback

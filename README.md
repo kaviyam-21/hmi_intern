@@ -6,19 +6,21 @@ An advanced, high-precision Vehicle Identification Number (VIN) extraction pipel
 
 - **Advanced Preprocessing Suite**: 
     - **LANCZOS4 Upscaling**: High-fidelity resolution enhancement for low-res inputs.
-    - **Shadow Normalization**: Gradient-based contrast stretching to neutralize metallic glare.
-    - **Unsharp Masking & LoG Sharpening**: Stroke amplification to resolve similar characters (e.g., M vs V, 8 vs B).
-    - **Dynamic Gamma Correction**: Multi-exposure simulation to capture faint engravings.
-- **Intelligent Extraction & Validation**:
-    - **Tiered Multi-Strategy OCR**: Iterates through multiple image variants until a valid VIN is found.
-    - **ISO 3779 Checksum Verification**: Mathematical validation using the Modulo 11 check digit (Position 9) to ensure 99.9% accuracy.
-    - **Fuzzy Recovery Logic**: Automated heuristic correction for common OCR confusions (e.g., swapping V->M or 8->B to satisfy checksum requirements).
+    - **Engraved-Text Enhancements**: CLAHE-based contrast boosts and light dilation tuned for metallic plates.
+- **Hybrid OCR & Merging**:
+    - **PaddleOCR Detection**: Robust text region detection on challenging industrial scenes.
+    - **EasyOCR CRNN Recognition**: Greedy CTC decoding with a strict industrial whitelist.
+    - **Sliding-Window Merging**: Smart overlap-aware merging with duplicate-tail suppression for long IDs.
+- **Flexible Input Modes**:
+    - **Image Mode**: Manual ROI selection (with automatic fallback ROI when GUI is unavailable).
+    - **Video Mode**: Multi-frame extraction with blur filtering and confidence-weighted fusion.
 
 ## 🛠️ Technology Stack
 
 - **Computer Vision**: OpenCV
-- **OCR Engine**: PaddleOCR (Deep Learning based)
-- **Deep Learning Framework**: PaddlePaddle
+- **Detection**: PaddleOCR
+- **Recognition**: EasyOCR (CRNN + CTC)
+- **Deep Learning Frameworks**: PaddlePaddle, PyTorch
 - **Language**: Python 3.9+
 
 ## 🚀 Quick Start
@@ -36,29 +38,26 @@ pip install -r requirements.txt
 ```
 
 ### 2. Usage
-Run the extractor on any image:
+
+Run the extractor on an image:
 
 ```powershell
-python main.py path/to/your/vin_image.jpg
+python main.py path\to\your\vin_image.jpg --mode image
+```
+
+Run the extractor on a video (multi-frame fusion):
+
+```powershell
+python main.py path\to\your\video.mp4 --mode video
 ```
 
 ## 🏗️ Project Structure
 
 ```text
 ├── vin_extractor/
-│   ├── preprocessing.py  # Advanced CV filters & variant generation
-│   ├── ocr_engine.py     # PaddleOCR wrapper with optimized params
-│   ├── validator.py      # ISO 3779 Checksum & Fuzzy Correction logic
-│   └── pipeline.py       # Orchestration & fallback logic
+│   ├── preprocessing.py  # CV filters & variant generation
+│   ├── ocr_engine.py     # PaddleOCR detection + EasyOCR recognition + merging
+│   └── pipeline.py       # Orchestration, image & video pipelines
 ├── main.py               # Entry point CLI
 └── requirements.txt      # Project dependencies
 ```
-
-## ⚖️ ISO 3779 Compliance
-The system strictly adheres to the ISO 3779 standard:
-- **Length**: 17 Alphanumeric characters.
-- **Exclusions**: Automatically handles or corrects prohibited characters (I, O, Q).
-- **Check Digit**: Validates the 9th character using standardized weights.
-
----
-*Developed for high-precision industrial HMI applications.*
